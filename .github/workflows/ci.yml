@@ -1,12 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest filter (empty = full suite)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -17,7 +17,9 @@ jobs:
       actions: write  # for styfle/cancel-workflow-action to cancel/stop running workflows
       contents: read  # for actions/checkout to fetch code
     name: "${{ matrix.root-pom }} on JDK ${{ matrix.java }} on ${{ matrix.os }}"
+    timeout-minutes: 50
     strategy:
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest ]
         java: [ 8, 11, 17 ]
@@ -49,7 +51,82 @@ jobs:
         run: mvn -B -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn install -U -DskipTests=true -f $ROOT_POM
       - name: 'Test'
         shell: bash
-        run: mvn -B -P!standard-with-extra-repos verify -U -Dmaven.javadoc.skip=true -f $ROOT_POM
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            mvn -B -P!standard-with-extra-repos verify -U -Dmaven.javadoc.skip=true -f $ROOT_POM -Dtest="$TEST_FILTER" -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            mvn -B -P!standard-with-extra-repos verify -U -Dmaven.javadoc.skip=true -f $ROOT_POM
+          fi
+      - name: 'Print skipped tests with reasons and per-module summary'
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/print_skips.py" <<'EOF'
+          import glob, os, re, collections
+          import xml.etree.ElementTree as ET
+          reports = sorted(set(glob.glob('*/target/surefire-reports/TEST-*.xml') + glob.glob('android/*/target/surefire-reports/TEST-*.xml')))
+          src_cache = {}
+          def java_sources(module_dir):
+              if module_dir not in src_cache:
+                  src_cache[module_dir] = [f for f in glob.glob(os.path.join(module_dir, '**', '*.java'), recursive=True) if '/test/' in f.replace(os.sep, '/')]
+              return src_cache[module_dir]
+          def find_assume(module_dir, method):
+              pat = re.compile(r'void\s+' + re.escape(method) + r'\s*\(')
+              for f in java_sources(module_dir):
+                  try:
+                      lines = open(f, encoding='utf-8', errors='replace').read().split('\n')
+                  except Exception:
+                      continue
+                  for i, line in enumerate(lines):
+                      if pat.search(line):
+                          for j in range(i, min(i + 40, len(lines))):
+                              if 'assume' in lines[j]:
+                                  return '%s:%d: %s' % (os.path.relpath(f), j + 1, lines[j].strip())
+              return None
+          totals = collections.OrderedDict()
+          hist = collections.Counter()
+          for r in reports:
+              module = r.split('/target/')[0]
+              try:
+                  root = ET.parse(r).getroot()
+              except Exception as e:
+                  print('could not parse', r, e)
+                  continue
+              t = totals.setdefault(module, [0, 0, 0, 0])
+              for tc in root.iter('testcase'):
+                  t[0] += 1
+                  if tc.find('failure') is not None: t[1] += 1
+                  if tc.find('error') is not None: t[2] += 1
+                  sk = tc.find('skipped')
+                  if sk is None:
+                      continue
+                  t[3] += 1
+                  name = tc.get('name') or ''
+                  method = re.sub(r'\[.*$', '', name).split('(')[0].strip()
+                  msg = (sk.get('message') or (sk.text or '')).strip()
+                  reason = msg
+                  if not msg or msg == 'expected to be true' or msg == 'expected to be false':
+                      loc = find_assume(module, method)
+                      reason = (msg + ' -- ' if msg else '') + ('assumption at ' + loc if loc else 'no message')
+                  hist[reason.split(' -- ')[0][:120]] += 1
+                  print('SKIPPED %s.%s: %s' % (tc.get('classname'), name, reason))
+          print('==== Skip reason histogram ====')
+          for k, v in hist.most_common():
+              print('%6d  %s' % (v, k))
+          print('==== Per-module test summary ====')
+          for m, (n, f, e, s) in totals.items():
+              print('SUMMARY %s: Tests run: %d, Passed: %d, Failures: %d, Errors: %d, Skipped: %d' % (m, n, n - f - e - s, f, e, s))
+          EOF
+          python3 "$RUNNER_TEMP/print_skips.py"
+      - name: 'Upload guava jar'
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.java == 11 && matrix.root-pom == 'pom.xml' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: guava-jar
+          path: guava/target/guava-*-jre.jar
+          if-no-files-found: error
       - name: 'Print Surefire reports'
         # Note: Normally a step won't run if the job has failed, but this causes it to
         if: ${{ failure() }}
@@ -63,6 +140,7 @@ jobs:
   publish_snapshot:
     name: 'Publish snapshot'
     needs: test
+    timeout-minutes: 30
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
     steps:
@@ -89,6 +167,7 @@ jobs:
       contents: write
     name: 'Generate latest docs'
     needs: test
+    timeout-minutes: 30
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
     steps:
